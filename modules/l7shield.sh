@@ -25,6 +25,7 @@ L7_CONFIG_FILE="$L7_CONFIG_DIR/config.conf"
 L7_WHITELIST="$L7_CONFIG_DIR/whitelist.txt"
 L7_BLACKLIST="$L7_CONFIG_DIR/blacklist.txt"
 L7_BLACKLIST_URLS="$L7_CONFIG_DIR/blacklist_urls.txt"
+L7_WHITELIST_REMOTE_URL_FILE="$L7_CONFIG_DIR/whitelist_remote_url"
 L7_VPN_PORTS="$L7_CONFIG_DIR/vpn_ports.txt"
 L7_GEOIP_ALLOW="$L7_CONFIG_DIR/geoip_allow.txt"
 L7_LOG="/opt/server-shield/logs/l7shield.log"
@@ -42,7 +43,7 @@ IPSET_GEOBLOCK="l7_geoblock"
 IPSET_AUTOBAN="l7_autoban"
 
 # Дефолтные VPN порты
-DEFAULT_VPN_PORTS="443 8443 2053 2083 2087 2096"
+DEFAULT_VPN_PORTS="443 9443 8443 7443 8090"
 
 # ============================================
 # GITHUB SYNC КОНФИГУРАЦИЯ
@@ -616,6 +617,91 @@ add_to_whitelist() {
     fi
     
     log_info "IP $ip добавлен в whitelist"
+}
+
+# Получить URL источника whitelist
+get_whitelist_remote_url() {
+    if [[ -f "$L7_WHITELIST_REMOTE_URL_FILE" ]]; then
+        head -n1 "$L7_WHITELIST_REMOTE_URL_FILE" 2>/dev/null | tr -d '\r\n'
+    fi
+}
+
+# Сохранить URL источника whitelist
+set_whitelist_remote_url() {
+    local url="$1"
+    mkdir -p "$L7_CONFIG_DIR"
+    echo "$url" > "$L7_WHITELIST_REMOTE_URL_FILE"
+}
+
+# Импорт whitelist из URL (например raw gist)
+import_whitelist_from_url() {
+    local url="${1:-}"
+    local backend
+    local tmp
+    local added=0
+    local exists=0
+    local invalid=0
+
+    if [[ -z "$url" ]]; then
+        url="$(get_whitelist_remote_url)"
+    fi
+
+    if [[ -z "$url" ]]; then
+        log_error "URL не указан"
+        return 1
+    fi
+
+    if [[ ! "$url" =~ ^https?:// ]]; then
+        log_error "URL должен начинаться с http:// или https://"
+        return 1
+    fi
+
+    if ! command -v curl >/dev/null 2>&1; then
+        if command -v apt-get >/dev/null 2>&1; then
+            log_step "Установка curl..."
+            apt-get update -qq
+            apt-get install -y curl >/dev/null 2>&1
+        else
+            log_error "curl не найден и apt-get недоступен"
+            return 1
+        fi
+    fi
+
+    tmp="$(mktemp)"
+    if ! curl -fsSL --connect-timeout 10 --max-time 120 "$url" -o "$tmp"; then
+        rm -f "$tmp"
+        log_error "Не удалось скачать whitelist по URL"
+        return 1
+    fi
+
+    set_whitelist_remote_url "$url"
+    backend="$(detect_firewall)"
+
+    while IFS= read -r ip; do
+        [[ -z "$ip" ]] && continue
+
+        if ! validate_ip "$ip"; then
+            ((invalid++))
+            continue
+        fi
+
+        if grep -q "^$ip$" "$L7_WHITELIST" 2>/dev/null; then
+            ((exists++))
+        else
+            echo "$ip" >> "$L7_WHITELIST"
+            ((added++))
+        fi
+
+        if [[ "$backend" == "nftables" ]]; then
+            nft_add_to_set "whitelist" "$ip" 2>/dev/null || true
+        else
+            ipset add "$IPSET_WHITELIST" "$ip" 2>/dev/null || true
+        fi
+    done < <(sed 's/#.*//g' "$tmp" | tr -s ' \t\r,' '\n' | sed '/^$/d' | sort -u)
+
+    rm -f "$tmp"
+
+    log_info "Импорт whitelist завершён: добавлено $added, уже было $exists, пропущено $invalid"
 }
 
 # Автобан IP
@@ -3532,6 +3618,12 @@ whitelist_menu() {
         echo ""
         echo -e "${WHITE}IP в whitelist (никогда не блокируются):${NC}"
         echo ""
+        local whitelist_remote_url
+        whitelist_remote_url="$(get_whitelist_remote_url)"
+        if [[ -n "$whitelist_remote_url" ]]; then
+            echo -e "  ${DIM}Источник:${NC} ${CYAN}$whitelist_remote_url${NC}"
+            echo ""
+        fi
         
         local i=1
         ipset list "$IPSET_WHITELIST" 2>/dev/null | grep "^[0-9]" | while read ip; do
@@ -3552,6 +3644,7 @@ whitelist_menu() {
         echo -e "  ${WHITE}1)${NC} Добавить IP"
         echo -e "  ${WHITE}2)${NC} Удалить IP"
         echo -e "  ${WHITE}3)${NC} Добавить текущий IP"
+        echo -e "  ${WHITE}4)${NC} Загрузить whitelist по URL (raw gist)"
         echo -e "  ${WHITE}0)${NC} Назад"
         echo ""
         read -p "Выбор: " choice
@@ -3580,6 +3673,12 @@ whitelist_menu() {
                 else
                     log_error "Не удалось определить IP"
                 fi
+                ;;
+            4)
+                echo ""
+                local url
+                read -p "URL списка (Enter = сохраненный): " url
+                import_whitelist_from_url "$url"
                 ;;
             0) return ;;
         esac

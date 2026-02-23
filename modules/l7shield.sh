@@ -682,15 +682,25 @@ setup_whitelist_sync_autoupdate() {
 #!/usr/bin/env bash
 set -euo pipefail
 
-source /opt/server-shield/modules/utils.sh 2>/dev/null || true
+LOG_FILE="/opt/server-shield/logs/l7_whitelist_sync.log"
+mkdir -p /opt/server-shield/logs
+exec >> "$LOG_FILE" 2>&1
+
+echo "[$(date '+%Y-%m-%d %H:%M:%S')] whitelist sync started"
+
+source /opt/server-shield/modules/utils.sh
 source /opt/server-shield/modules/l7shield.sh
 
 init_l7_config
-url="$(get_whitelist_remote_url)"
-[[ -z "$url" ]] && exit 0
+url="$(get_whitelist_remote_url || true)"
+if [[ -z "$url" ]]; then
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] whitelist sync skipped: URL is empty"
+    exit 0
+fi
 
 export L7_WHITELIST_SYNC_SKIP_SETUP=1
-import_whitelist_from_url "$url" >> /opt/server-shield/logs/l7_whitelist_sync.log 2>&1
+import_whitelist_from_url "$url"
+echo "[$(date '+%Y-%m-%d %H:%M:%S')] whitelist sync finished"
 SCRIPT
 
     chmod +x "$L7_WHITELIST_SYNC_SCRIPT"

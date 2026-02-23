@@ -682,25 +682,81 @@ setup_whitelist_sync_autoupdate() {
 #!/usr/bin/env bash
 set -euo pipefail
 
-LOG_FILE="/opt/server-shield/logs/l7_whitelist_sync.log"
-mkdir -p /opt/server-shield/logs
-exec >> "$LOG_FILE" 2>&1
+LOG="/opt/server-shield/logs/l7_whitelist_sync.log"
+URL_FILE="/opt/server-shield/config/l7shield/whitelist_remote_url"
+WL_FILE="/opt/server-shield/config/l7shield/whitelist.txt"
+NFT_TABLE="l7shield"
+NFT_SET="whitelist"
+IPSET_WHITELIST="l7_whitelist"
 
+mkdir -p /opt/server-shield/logs /opt/server-shield/config/l7shield
+touch "$WL_FILE"
+
+exec >>"$LOG" 2>&1
 echo "[$(date '+%Y-%m-%d %H:%M:%S')] whitelist sync started"
 
-source /opt/server-shield/modules/utils.sh
-source /opt/server-shield/modules/l7shield.sh
-
-init_l7_config
-url="$(get_whitelist_remote_url || true)"
+url=""
+[[ -f "$URL_FILE" ]] && url="$(head -n1 "$URL_FILE" | tr -d '\r\n')"
 if [[ -z "$url" ]]; then
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] whitelist sync skipped: URL is empty"
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] skipped: URL is empty"
     exit 0
 fi
 
-export L7_WHITELIST_SYNC_SKIP_SETUP=1
-import_whitelist_from_url "$url"
-echo "[$(date '+%Y-%m-%d %H:%M:%S')] whitelist sync finished"
+tmp="$(mktemp)"
+cleaned="$(mktemp)"
+trap 'rm -f "$tmp" "$cleaned"' EXIT
+
+if ! curl -fsSL --connect-timeout 10 --max-time 120 "$url" -o "$tmp"; then
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] failed: cannot download URL"
+    exit 1
+fi
+
+sed 's/#.*//g' "$tmp" | tr -s ' \t\r,' '\n' | sed '/^$/d' | sort -u > "$cleaned"
+
+added=0
+exists=0
+invalid=0
+
+while IFS= read -r ip; do
+    [[ -z "$ip" ]] && continue
+
+    if ! [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+        invalid=$((invalid + 1))
+        continue
+    fi
+
+    IFS=. read -r a b c d <<<"$ip"
+    if ((a > 255 || b > 255 || c > 255 || d > 255)); then
+        invalid=$((invalid + 1))
+        continue
+    fi
+
+    if grep -q "^$ip$" "$WL_FILE" 2>/dev/null; then
+        exists=$((exists + 1))
+    else
+        echo "$ip" >> "$WL_FILE"
+        added=$((added + 1))
+    fi
+done < "$cleaned"
+
+sort -u "$WL_FILE" -o "$WL_FILE"
+
+if command -v nft >/dev/null 2>&1 && nft list set inet "$NFT_TABLE" "$NFT_SET" >/dev/null 2>&1; then
+    while IFS= read -r ip; do
+        [[ -z "$ip" ]] && continue
+        nft add element inet "$NFT_TABLE" "$NFT_SET" "{ $ip }" 2>/dev/null || true
+    done < "$WL_FILE"
+elif command -v ipset >/dev/null 2>&1; then
+    if ! ipset list "$IPSET_WHITELIST" >/dev/null 2>&1; then
+        ipset create "$IPSET_WHITELIST" hash:ip -exist >/dev/null 2>&1 || true
+    fi
+    while IFS= read -r ip; do
+        [[ -z "$ip" ]] && continue
+        ipset add "$IPSET_WHITELIST" "$ip" -exist 2>/dev/null || true
+    done < "$WL_FILE"
+fi
+
+echo "[$(date '+%Y-%m-%d %H:%M:%S')] done: added=$added exists=$exists invalid=$invalid"
 SCRIPT
 
     chmod +x "$L7_WHITELIST_SYNC_SCRIPT"

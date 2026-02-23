@@ -8,6 +8,74 @@ source "$(dirname "$0")/utils.sh" 2>/dev/null || source "/opt/server-shield/modu
 # Файл конфига SSH
 SSH_CONFIG="/etc/ssh/sshd_config"
 
+# Определение имени SSH unit для systemd
+detect_ssh_service_name() {
+    if ! command -v systemctl >/dev/null 2>&1; then
+        echo "ssh"
+        return 0
+    fi
+
+    if systemctl cat ssh.service >/dev/null 2>&1; then
+        echo "ssh"
+    elif systemctl cat sshd.service >/dev/null 2>&1; then
+        echo "sshd"
+    else
+        echo "ssh"
+    fi
+}
+
+# Поиск PID sshd, которые реально слушают указанные порты
+find_sshd_listener_pids() {
+    local port
+    for port in "$@"; do
+        [[ -z "$port" ]] && continue
+        ss -lntpH 2>/dev/null | awk -v p="$port" '$4 ~ ":" p "$" {print}'
+    done | sed -n 's/.*pid=\([0-9]\+\).*/\1/p' | sort -u
+}
+
+# Очистка зависших listener-процессов sshd, мешающих запуску systemd unit
+cleanup_stale_sshd_listeners() {
+    local pids
+    pids="$(find_sshd_listener_pids "$@")"
+    [[ -z "$pids" ]] && return 0
+
+    while IFS= read -r pid; do
+        [[ -z "$pid" ]] && continue
+        if ps -p "$pid" -o comm= 2>/dev/null | grep -qx "sshd"; then
+            kill "$pid" 2>/dev/null || true
+        fi
+    done <<< "$pids"
+
+    sleep 1
+
+    pids="$(find_sshd_listener_pids "$@")"
+    [[ -z "$pids" ]] && return 0
+
+    while IFS= read -r pid; do
+        [[ -z "$pid" ]] && continue
+        if ps -p "$pid" -o comm= 2>/dev/null | grep -qx "sshd"; then
+            kill -9 "$pid" 2>/dev/null || true
+        fi
+    done <<< "$pids"
+
+    sleep 1
+}
+
+# Привести SSH в чистое состояние перед стартом unit
+prepare_clean_ssh_start() {
+    local service_name="$1"
+    shift || true
+    local ports=("$@")
+
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl stop ssh.socket 2>/dev/null || true
+        systemctl stop "$service_name" 2>/dev/null || true
+        systemctl reset-failed "$service_name" 2>/dev/null || true
+    fi
+
+    cleanup_stale_sshd_listeners "${ports[@]}"
+}
+
 # Всегда переводим OpenSSH в service mode, без socket activation.
 disable_ssh_socket_mode() {
     if ! command -v systemctl >/dev/null 2>&1; then
@@ -39,6 +107,8 @@ disable_ssh_socket_mode() {
 # Универсальная функция перезапуска SSH (надёжная)
 restart_ssh_service() {
     local target_port="${1:-}"
+    local check_port="${target_port:-$(get_ssh_port 2>/dev/null || true)}"
+    [[ -z "$check_port" ]] && check_port="22"
     
     # 0. Создаём директорию /run/sshd если не существует (критично!)
     if [[ ! -d /run/sshd ]]; then
@@ -56,30 +126,25 @@ restart_ssh_service() {
     # 2. Убираем socket activation, чтобы избежать IPv6-only listener.
     disable_ssh_socket_mode
     
-    # 3. Определяем имя сервиса (классический способ)
-    local service_name=""
-    if systemctl list-units --type=service 2>/dev/null | grep -q "ssh.service"; then
-        service_name="ssh"
-    elif systemctl list-units --type=service 2>/dev/null | grep -q "sshd.service"; then
-        service_name="sshd"
-    fi
-    
-    # 4. Перезапускаем через systemctl
-    if [[ -n "$service_name" ]]; then
-        systemctl restart "$service_name" 2>/dev/null
+    # 3. Определяем имя сервиса
+    local service_name
+    service_name="$(detect_ssh_service_name)"
+
+    # 4. Перезапуск через systemctl с очисткой зависших listener'ов
+    if command -v systemctl >/dev/null 2>&1; then
+        prepare_clean_ssh_start "$service_name" "$check_port" "22"
+
+        systemctl start "$service_name" 2>/dev/null
         sleep 1
-        
-        # Проверяем запустился ли
+
         if systemctl is-active --quiet "$service_name"; then
             return 0
         fi
-        
-        # Если не запустился - пробуем stop/start
-        systemctl stop "$service_name" 2>/dev/null
+
+        prepare_clean_ssh_start "$service_name" "$check_port" "22"
+        systemctl restart "$service_name" 2>/dev/null
         sleep 1
-        systemctl start "$service_name" 2>/dev/null
-        sleep 1
-        
+
         if systemctl is-active --quiet "$service_name"; then
             return 0
         fi
@@ -89,9 +154,9 @@ restart_ssh_service() {
     service ssh restart 2>/dev/null || service sshd restart 2>/dev/null
     sleep 1
     
-    # 6. Крайний случай - убиваем и запускаем напрямую
-    if [[ -n "$target_port" ]] && ! ss -tlnp | grep -q ":$target_port"; then
-        pkill -9 sshd 2>/dev/null
+    # 6. Крайний случай - чистим listener и запускаем напрямую
+    if ! ss -tlnp | grep -q ":$check_port"; then
+        prepare_clean_ssh_start "$service_name" "$check_port" "22"
         sleep 1
         /usr/sbin/sshd 2>/dev/null
         sleep 1
@@ -204,7 +269,7 @@ BANNER
     if ! ss -tlnp | grep -q ":$new_port"; then
         log_error "SSH не запустился на порту $new_port после $max_attempts попыток"
         # Аварийный запуск напрямую
-        pkill -9 sshd 2>/dev/null
+        cleanup_stale_sshd_listeners "$new_port" "22"
         sleep 1
         /usr/sbin/sshd
         sleep 2
@@ -343,7 +408,7 @@ change_ssh_port() {
     # Аварийный запуск если не удалось
     if [[ "$ssh_started" == false ]]; then
         log_warn "Аварийный запуск SSH..."
-        pkill -9 sshd 2>/dev/null
+        cleanup_stale_sshd_listeners "$new_port" "22"
         sleep 1
         /usr/sbin/sshd
         sleep 2

@@ -705,6 +705,20 @@ generate_nft_config() {
     
     local vpn_ports=$(get_vpn_ports | tr ' ' ',')
     local ssh_port=$(get_config "SSH_PORT" "22")
+    local syn_rate_nft="${SYN_RATE:-100/second}"
+    
+    # nft prefers explicit time units: /second, /minute, /hour.
+    case "$syn_rate_nft" in
+        */s|*/sec|*/secs)
+            syn_rate_nft="${syn_rate_nft%%/*}/second"
+            ;;
+        */m|*/min|*/mins)
+            syn_rate_nft="${syn_rate_nft%%/*}/minute"
+            ;;
+        */h|*/hr|*/hrs)
+            syn_rate_nft="${syn_rate_nft%%/*}/hour"
+            ;;
+    esac
     
     # Читаем whitelist
     local whitelist_ips=""
@@ -787,7 +801,7 @@ table inet $NFT_TABLE {
         ct state invalid drop
         
         # ===== SYN FLOOD PROTECTION =====
-        tcp flags syn limit rate ${SYN_RATE:-100/second} burst ${SYN_BURST:-200} packets accept
+        tcp flags syn limit rate ${syn_rate_nft} burst ${SYN_BURST:-200} packets accept
         tcp flags syn drop
         
         # ===== MALFORMED PACKETS =====
@@ -812,7 +826,7 @@ table inet $NFT_TABLE {
         tcp dport { 80, 443 } ct count over ${CONN_LIMIT_HTTP:-100} drop
         
         # ===== ГЛОБАЛЬНЫЙ ЛИМИТ =====
-        tcp ct count over ${CONN_LIMIT_GLOBAL:-200} drop
+        meta l4proto tcp ct count over ${CONN_LIMIT_GLOBAL:-200} drop
     }
     
     chain forward {

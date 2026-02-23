@@ -786,15 +786,15 @@ import_whitelist_from_url() {
         [[ -z "$ip" ]] && continue
 
         if ! validate_ip "$ip"; then
-            ((invalid++))
+            invalid=$((invalid + 1))
             continue
         fi
 
         if grep -q "^$ip$" "$L7_WHITELIST" 2>/dev/null; then
-            ((exists++))
+            exists=$((exists + 1))
         else
             echo "$ip" >> "$L7_WHITELIST"
-            ((added++))
+            added=$((added + 1))
         fi
 
         if [[ "$backend" == "nftables" ]]; then

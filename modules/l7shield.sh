@@ -68,6 +68,17 @@ L7_SYNC_QUEUE="$L7_CONFIG_DIR/sync_queue.txt"
 L7_SYNCED_IPS="$L7_CONFIG_DIR/synced_ips.txt"
 L7_LAST_SYNC="$L7_CONFIG_DIR/last_sync.txt"
 
+# Subnet blocklist (nftables)
+SUBNET_BLOCKLIST_URL_DEFAULT="https://raw.githubusercontent.com/Loorrr293/blocklist/main/blocklist.txt"
+SUBNET_BLOCKLIST_URL_FILE="$L7_CONFIG_DIR/subnet_blocklist_url"
+SUBNET_BLOCKLIST_STATE_FILE="$L7_CONFIG_DIR/subnet_blocklist_state"
+SUBNET_BLOCKLIST_TABLE="shield_subnets"
+SUBNET_BLOCKLIST_V4_SET="v4"
+SUBNET_BLOCKLIST_V6_SET="v6"
+SUBNET_BLOCKLIST_SCRIPT="/opt/server-shield/scripts/update-subnet-blocklist.sh"
+SUBNET_BLOCKLIST_SERVICE="/etc/systemd/system/shield-subnet-blocklist.service"
+SUBNET_BLOCKLIST_TIMER="/etc/systemd/system/shield-subnet-blocklist.timer"
+
 # ============================================
 # ИНИЦИАЛИЗАЦИЯ
 # ============================================
@@ -170,6 +181,11 @@ EOF
     [[ ! -f "$L7_WHITELIST" ]] && echo "# IP whitelist (один на строку)" > "$L7_WHITELIST"
     [[ ! -f "$L7_BLACKLIST" ]] && echo "# IP blacklist (один на строку)" > "$L7_BLACKLIST"
     [[ ! -f "$L7_BLACKLIST_URLS" ]] && echo "# URLs для скачивания blacklist (один на строку)" > "$L7_BLACKLIST_URLS"
+
+    # URL источника нежелательных подсетей для nft blocklist
+    if [[ ! -f "$SUBNET_BLOCKLIST_URL_FILE" ]]; then
+        echo "$SUBNET_BLOCKLIST_URL_DEFAULT" > "$SUBNET_BLOCKLIST_URL_FILE"
+    fi
     [[ ! -f "$L7_GEOIP_ALLOW" ]] && cat > "$L7_GEOIP_ALLOW" << 'EOF'
 # GeoIP - разрешённые страны (ISO коды)
 # Раскомментируйте нужные
@@ -208,6 +224,330 @@ get_vpn_ports() {
         grep -v "^#" "$L7_VPN_PORTS" | grep -v "^$" | tr '\n' ' '
     else
         echo "$DEFAULT_VPN_PORTS"
+    fi
+}
+
+# ============================================
+# SUBNET BLOCKLIST (NFTABLES)
+# ============================================
+
+subnet_blocklist_get_url() {
+    local url=""
+
+    if [[ -f "$SUBNET_BLOCKLIST_URL_FILE" ]]; then
+        url="$(head -n1 "$SUBNET_BLOCKLIST_URL_FILE" 2>/dev/null | tr -d '\r\n')"
+    fi
+
+    if [[ -z "$url" ]]; then
+        url="$SUBNET_BLOCKLIST_URL_DEFAULT"
+    fi
+
+    echo "$url"
+}
+
+subnet_blocklist_set_url() {
+    local url="$1"
+
+    if [[ -z "$url" ]]; then
+        log_error "URL не может быть пустым"
+        return 1
+    fi
+
+    if [[ ! "$url" =~ ^https?:// ]]; then
+        log_error "URL должен начинаться с http:// или https://"
+        return 1
+    fi
+
+    mkdir -p "$(dirname "$SUBNET_BLOCKLIST_URL_FILE")"
+    echo "$url" > "$SUBNET_BLOCKLIST_URL_FILE"
+    log_info "URL источника подсетей сохранен"
+}
+
+subnet_blocklist_state_get() {
+    local key="$1"
+    local default="${2:-}"
+    local value=""
+
+    if [[ -f "$SUBNET_BLOCKLIST_STATE_FILE" ]]; then
+        value="$(grep -m1 "^${key}=" "$SUBNET_BLOCKLIST_STATE_FILE" 2>/dev/null | cut -d'=' -f2-)"
+    fi
+
+    if [[ -z "$value" ]]; then
+        value="$default"
+    fi
+
+    echo "$value"
+}
+
+subnet_blocklist_normalize_count() {
+    local count="${1:-0}"
+    if [[ "$count" =~ ^[0-9]+$ ]]; then
+        echo "$count"
+    else
+        echo "0"
+    fi
+}
+
+subnet_blocklist_counts() {
+    local v4
+    local v6
+
+    v4="$(subnet_blocklist_normalize_count "$(subnet_blocklist_state_get "v4_count" "0")")"
+    v6="$(subnet_blocklist_normalize_count "$(subnet_blocklist_state_get "v6_count" "0")")"
+
+    echo "$v4 $v6 $((v4 + v6))"
+}
+
+subnet_blocklist_timer_enabled() {
+    systemctl is-enabled --quiet shield-subnet-blocklist.timer 2>/dev/null
+}
+
+subnet_blocklist_ensure_dependencies() {
+    local packages=()
+
+    command -v nft >/dev/null 2>&1 || packages+=("nftables")
+    command -v curl >/dev/null 2>&1 || packages+=("curl")
+    command -v python3 >/dev/null 2>&1 || packages+=("python3")
+
+    if (( ${#packages[@]} == 0 )); then
+        return 0
+    fi
+
+    if ! command -v apt-get >/dev/null 2>&1; then
+        log_error "Не удалось установить зависимости автоматически (нужен apt-get)"
+        return 1
+    fi
+
+    log_step "Установка зависимостей: ${packages[*]}"
+    apt-get update -qq
+    apt-get install -y "${packages[@]}" >/dev/null 2>&1
+}
+
+subnet_blocklist_write_script() {
+    mkdir -p "$(dirname "$SUBNET_BLOCKLIST_SCRIPT")"
+
+    cat > "$SUBNET_BLOCKLIST_SCRIPT" << 'SCRIPT'
+#!/usr/bin/env bash
+set -euo pipefail
+
+URL_FILE="/opt/server-shield/config/l7shield/subnet_blocklist_url"
+STATE_FILE="/opt/server-shield/config/l7shield/subnet_blocklist_state"
+TABLE="shield_subnets"
+SET_V4="v4"
+SET_V6="v6"
+
+url="${1:-}"
+if [[ -z "$url" && -f "$URL_FILE" ]]; then
+    url="$(head -n1 "$URL_FILE" | tr -d '\r\n')"
+fi
+
+if [[ -z "$url" ]]; then
+    echo "Usage: $0 <URL>" >&2
+    exit 1
+fi
+
+mkdir -p "$(dirname "$STATE_FILE")"
+
+nft add table inet "$TABLE" 2>/dev/null || true
+nft add set inet "$TABLE" "$SET_V4" '{ type ipv4_addr; flags interval; }' 2>/dev/null || true
+nft add set inet "$TABLE" "$SET_V6" '{ type ipv6_addr; flags interval; }' 2>/dev/null || true
+
+if ! nft list chain inet "$TABLE" input >/dev/null 2>&1; then
+    nft add chain inet "$TABLE" input '{ type filter hook input priority raw; policy accept; }'
+fi
+
+nft list chain inet "$TABLE" input | grep -q "@$SET_V4" || nft add rule inet "$TABLE" input ip saddr @"$SET_V4" counter drop
+nft list chain inet "$TABLE" input | grep -q "@$SET_V6" || nft add rule inet "$TABLE" input ip6 saddr @"$SET_V6" counter drop
+
+tmp="$(mktemp)"
+cleaned="$(mktemp)"
+v4="$(mktemp)"
+v6="$(mktemp)"
+nf="$(mktemp)"
+trap 'rm -f "$tmp" "$cleaned" "$v4" "$v6" "$nf"' EXIT
+
+curl -fsSL "$url" > "$tmp"
+sed 's/#.*//g' "$tmp" | tr -s ' \t\r' '\n' | sed '/^$/d' | sort -u > "$cleaned"
+
+python3 - "$cleaned" > "$v4" <<'PY'
+import sys, ipaddress
+path = sys.argv[1]
+nets = []
+for line in open(path, 'r', encoding='utf-8', errors='ignore'):
+    s = line.strip()
+    if not s or ':' in s:
+        continue
+    try:
+        nets.append(ipaddress.ip_network(s, strict=False))
+    except ValueError:
+        pass
+collapsed = sorted(ipaddress.collapse_addresses(nets), key=lambda n: (int(n.network_address), n.prefixlen))
+for n in collapsed:
+    print(n.with_prefixlen)
+PY
+
+python3 - "$cleaned" > "$v6" <<'PY'
+import sys, ipaddress
+path = sys.argv[1]
+nets = []
+for line in open(path, 'r', encoding='utf-8', errors='ignore'):
+    s = line.strip()
+    if not s or ':' not in s:
+        continue
+    try:
+        nets.append(ipaddress.ip_network(s, strict=False))
+    except ValueError:
+        pass
+collapsed = sorted(ipaddress.collapse_addresses(nets), key=lambda n: (int(n.network_address), n.prefixlen))
+for n in collapsed:
+    print(n.with_prefixlen)
+PY
+
+{
+    echo "flush set inet $TABLE $SET_V4"
+    echo "flush set inet $TABLE $SET_V6"
+    if [[ -s "$v4" ]]; then
+        echo -n "add element inet $TABLE $SET_V4 { "
+        paste -sd, "$v4"
+        echo " }"
+    fi
+    if [[ -s "$v6" ]]; then
+        echo -n "add element inet $TABLE $SET_V6 { "
+        paste -sd, "$v6"
+        echo " }"
+    fi
+} > "$nf"
+
+nft -f "$nf"
+
+v4_count="$(wc -l < "$v4" | tr -d ' ')"
+v6_count="$(wc -l < "$v6" | tr -d ' ')"
+
+{
+    echo "last_update=$(date '+%Y-%m-%d %H:%M:%S')"
+    echo "source_url=$url"
+    echo "v4_count=$v4_count"
+    echo "v6_count=$v6_count"
+} > "$STATE_FILE"
+
+echo "OK: v4=$v4_count v6=$v6_count"
+SCRIPT
+
+    chmod +x "$SUBNET_BLOCKLIST_SCRIPT"
+}
+
+subnet_blocklist_write_units() {
+    cat > "$SUBNET_BLOCKLIST_SERVICE" << UNIT
+[Unit]
+Description=Server Shield subnet blocklist updater
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=$SUBNET_BLOCKLIST_SCRIPT
+UNIT
+
+    cat > "$SUBNET_BLOCKLIST_TIMER" << 'TIMER'
+[Unit]
+Description=Server Shield subnet blocklist update timer
+
+[Timer]
+OnBootSec=1min
+OnCalendar=daily
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+TIMER
+}
+
+subnet_blocklist_install() {
+    init_l7_config
+    subnet_blocklist_ensure_dependencies || return 1
+    subnet_blocklist_write_script
+    subnet_blocklist_write_units
+
+    systemctl daemon-reload
+
+    if ! systemctl enable --now shield-subnet-blocklist.timer >/dev/null 2>&1; then
+        log_error "Не удалось включить таймер shield-subnet-blocklist.timer"
+        return 1
+    fi
+
+    log_step "Первичное обновление списка подсетей..."
+    if ! systemctl start shield-subnet-blocklist.service >/dev/null 2>&1; then
+        log_error "Не удалось обновить список подсетей"
+        return 1
+    fi
+
+    local counts
+    counts="$(subnet_blocklist_counts)"
+    log_info "Subnet blocklist включен (${counts##* }) записей"
+}
+
+subnet_blocklist_update_now() {
+    init_l7_config
+
+    if [[ ! -x "$SUBNET_BLOCKLIST_SCRIPT" ]]; then
+        log_warn "Скрипт subnet blocklist не найден, выполняю установку..."
+        subnet_blocklist_install || return 1
+        return 0
+    fi
+
+    log_step "Обновление списка нежелательных подсетей..."
+    if ! "$SUBNET_BLOCKLIST_SCRIPT"; then
+        log_error "Обновление subnet blocklist завершилось с ошибкой"
+        return 1
+    fi
+}
+
+subnet_blocklist_disable() {
+    systemctl disable --now shield-subnet-blocklist.timer 2>/dev/null || true
+    systemctl stop shield-subnet-blocklist.service 2>/dev/null || true
+
+    if command -v nft >/dev/null 2>&1; then
+        nft delete table inet "$SUBNET_BLOCKLIST_TABLE" 2>/dev/null || true
+    fi
+
+    log_info "Subnet blocklist отключен"
+}
+
+show_subnet_blocklist_status() {
+    init_l7_config
+
+    local url
+    local last_update
+    local next_run
+    local v4
+    local v6
+    local total
+
+    url="$(subnet_blocklist_get_url)"
+    last_update="$(subnet_blocklist_state_get "last_update" "never")"
+    read -r v4 v6 total <<< "$(subnet_blocklist_counts)"
+
+    echo ""
+    echo -e "    ${WHITE}Subnet Blocklist (nft):${NC}"
+    show_info "Источник" "$url"
+    show_info "Подсети" "$total (IPv4: $v4, IPv6: $v6)"
+    show_info "Последнее обновление" "$last_update"
+
+    if subnet_blocklist_timer_enabled; then
+        show_status_line "Auto-update timer" "on" "daily"
+    else
+        show_status_line "Auto-update timer" "off"
+    fi
+
+    if command -v nft >/dev/null 2>&1 && nft list table inet "$SUBNET_BLOCKLIST_TABLE" >/dev/null 2>&1; then
+        show_status_line "nft table ${SUBNET_BLOCKLIST_TABLE}" "on"
+    else
+        show_status_line "nft table ${SUBNET_BLOCKLIST_TABLE}" "off"
+    fi
+
+    if subnet_blocklist_timer_enabled; then
+        next_run="$(systemctl show -p NextElapseUSecRealtime --value shield-subnet-blocklist.timer 2>/dev/null || true)"
+        [[ -n "$next_run" && "$next_run" != "n/a" ]] && show_info "Следующий запуск" "$next_run"
     fi
 }
 
@@ -2809,6 +3149,26 @@ show_l7_status() {
     else
         echo -e "  ${WHITE}GeoIP:${NC} ${YELLOW}Выключен${NC}"
     fi
+
+    # Subnet blocklist
+    echo ""
+    echo -e "  ${WHITE}Subnet Blocklist (nft):${NC}"
+    local subnet_url
+    local subnet_last
+    local subnet_v4
+    local subnet_v6
+    local subnet_total
+    subnet_url="$(subnet_blocklist_get_url)"
+    subnet_last="$(subnet_blocklist_state_get "last_update" "never")"
+    read -r subnet_v4 subnet_v6 subnet_total <<< "$(subnet_blocklist_counts)"
+    echo -e "    URL: ${CYAN}$subnet_url${NC}"
+    echo -e "    Total: ${CYAN}$subnet_total${NC} (v4: $subnet_v4, v6: $subnet_v6)"
+    echo -e "    Last update: ${CYAN}$subnet_last${NC}"
+    if subnet_blocklist_timer_enabled; then
+        echo -e "    Timer: ${GREEN}enabled${NC}"
+    else
+        echo -e "    Timer: ${YELLOW}disabled${NC}"
+    fi
     
     # Текущие соединения
     echo ""
@@ -3076,6 +3436,85 @@ blacklist_menu() {
                 if confirm_action "Очистить локальный blacklist?" "n"; then
                     clear_local_blacklist
                     log_warn "GitHub база не затронута"
+                fi
+                press_any_key
+                ;;
+            0|q) return ;;
+        esac
+    done
+}
+
+# Меню блокировки подсетей
+subnet_blocklist_menu() {
+    while true; do
+        print_header_mini "Subnet Blocklist (nft)"
+
+        local url
+        local last_update
+        local next_run=""
+        local v4
+        local v6
+        local total
+
+        url="$(subnet_blocklist_get_url)"
+        last_update="$(subnet_blocklist_state_get "last_update" "never")"
+        read -r v4 v6 total <<< "$(subnet_blocklist_counts)"
+
+        echo ""
+        show_info "Источник" "$url"
+        show_info "Подсетей загружено" "$total (IPv4: $v4, IPv6: $v6)"
+        show_info "Последнее обновление" "$last_update"
+
+        if subnet_blocklist_timer_enabled; then
+            show_status_line "Auto-update timer" "on" "daily"
+            next_run="$(systemctl show -p NextElapseUSecRealtime --value shield-subnet-blocklist.timer 2>/dev/null || true)"
+            [[ -n "$next_run" && "$next_run" != "n/a" ]] && show_info "Следующий запуск" "$next_run"
+        else
+            show_status_line "Auto-update timer" "off"
+        fi
+
+        if command -v nft >/dev/null 2>&1 && nft list table inet "$SUBNET_BLOCKLIST_TABLE" >/dev/null 2>&1; then
+            show_status_line "nft table ${SUBNET_BLOCKLIST_TABLE}" "on"
+        else
+            show_status_line "nft table ${SUBNET_BLOCKLIST_TABLE}" "off"
+        fi
+
+        echo ""
+        print_divider
+        echo ""
+        menu_item "1" "Установить/включить subnet blocklist"
+        menu_item "2" "Обновить сейчас"
+        menu_item "3" "Изменить URL источника"
+        menu_item "4" "Показать статус"
+        menu_item "5" "Отключить subnet blocklist"
+        menu_divider
+        menu_item "0" "Назад"
+
+        local choice
+        choice="$(read_choice)"
+
+        case "${choice,,}" in
+            1)
+                subnet_blocklist_install
+                press_any_key
+                ;;
+            2)
+                subnet_blocklist_update_now
+                press_any_key
+                ;;
+            3)
+                local new_url
+                input_value "URL источника подсетей" "$url" new_url
+                subnet_blocklist_set_url "$new_url"
+                press_any_key
+                ;;
+            4)
+                show_subnet_blocklist_status
+                press_any_key
+                ;;
+            5)
+                if confirm_action "Отключить subnet blocklist и удалить nft table?" "n"; then
+                    subnet_blocklist_disable
                 fi
                 press_any_key
                 ;;
@@ -3360,6 +3799,14 @@ l7_menu() {
         fi
         
         local total_conn=$(ss -tn state established 2>/dev/null | wc -l || echo 0)
+        local subnet_v4=0
+        local subnet_v6=0
+        local subnet_total=0
+        local subnet_timer_state="off"
+        read -r subnet_v4 subnet_v6 subnet_total <<< "$(subnet_blocklist_counts)"
+        if subnet_blocklist_timer_enabled; then
+            subnet_timer_state="on"
+        fi
         
         echo -e "    ${DIM}┌─────────────────────────────────────────────────────┐${NC}"
         if [[ "$L7_ENABLED" == "true" ]]; then
@@ -3369,6 +3816,9 @@ l7_menu() {
         fi
         echo -e "    ${DIM}│${NC} Blacklist: ${RED}$blacklist_count${NC}  Auto-ban: ${YELLOW}$autoban_count${NC}  Conn: ${CYAN}$total_conn${NC}     ${DIM}│${NC}"
         echo -e "    ${DIM}└─────────────────────────────────────────────────────┘${NC}"
+        echo ""
+        echo -e "    ${DIM}Limits:${NC} G:${CYAN}$CONN_LIMIT_GLOBAL${NC} VPN:${CYAN}$CONN_LIMIT_VPN${NC} SSH:${CYAN}$CONN_LIMIT_SSH${NC}"
+        echo -e "    ${DIM}Subnet Blocklist:${NC} ${CYAN}$subnet_total${NC} (v4:$subnet_v4 v6:$subnet_v6), timer: ${CYAN}$subnet_timer_state${NC}"
         echo ""
         
         menu_item "1" "Полный статус"
@@ -3388,6 +3838,7 @@ l7_menu() {
         menu_item "7" "IP Whitelist"
         menu_item "8" "GeoIP блокировка"
         menu_item "9" "Настройка лимитов"
+        menu_item "u" "Subnet Blocklist (nft)"
         menu_divider
         menu_item "n" "Nginx защита"
         menu_item "f" "Fail2Ban L7"
@@ -3427,6 +3878,7 @@ l7_menu() {
             7) whitelist_menu ;;
             8) geoip_menu ;;
             9) limits_menu ;;
+            u) subnet_blocklist_menu ;;
             n) nginx_menu ;;
             f) fail2ban_l7_menu ;;
             b) firewall_backend_menu ;;
@@ -5537,7 +5989,11 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
         stop_silent) stop_silent ;;
         reload_silent) reload_silent ;;
         sync|sync_blocklist|github_sync) github_full_sync ;;
+        subnet_install) subnet_blocklist_install ;;
+        subnet_update) subnet_blocklist_update_now ;;
+        subnet_status) show_subnet_blocklist_status ;;
+        subnet_disable) subnet_blocklist_disable ;;
         menu|"") l7_menu ;;
-        *) echo "Usage: $0 {enable|disable|reload|status|sync|menu}" ;;
+        *) echo "Usage: $0 {enable|disable|reload|status|sync|menu|subnet_install|subnet_update|subnet_status|subnet_disable}" ;;
     esac
 fi

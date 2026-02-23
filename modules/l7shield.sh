@@ -36,6 +36,9 @@ L7_NGINX_CONF="/etc/nginx/conf.d/l7shield.conf"
 L7_NGINX_MAPS="/etc/nginx/conf.d/l7shield_maps.conf"
 L7_CRON="/etc/cron.d/shield-l7"
 L7_SERVICE="/etc/systemd/system/shield-l7.service"
+L7_WHITELIST_SYNC_SCRIPT="/opt/server-shield/scripts/l7-whitelist-sync.sh"
+L7_WHITELIST_SYNC_SERVICE="/etc/systemd/system/shield-l7-whitelist-sync.service"
+L7_WHITELIST_SYNC_TIMER="/etc/systemd/system/shield-l7-whitelist-sync.timer"
 
 IPSET_BLACKLIST="l7_blacklist"
 IPSET_WHITELIST="l7_whitelist"
@@ -610,13 +613,36 @@ remove_from_blacklist() {
 # Добавить IP в whitelist
 add_to_whitelist() {
     local ip="$1"
-    
-    ipset add "$IPSET_WHITELIST" "$ip" 2>/dev/null
+    local backend
+    backend="$(detect_firewall)"
+
+    if [[ "$backend" == "nftables" ]]; then
+        nft_add_to_set "whitelist" "$ip" 2>/dev/null || true
+    else
+        ipset add "$IPSET_WHITELIST" "$ip" 2>/dev/null || true
+    fi
+
     if ! grep -q "^$ip$" "$L7_WHITELIST" 2>/dev/null; then
         echo "$ip" >> "$L7_WHITELIST"
     fi
     
     log_info "IP $ip добавлен в whitelist"
+}
+
+# Удалить IP из whitelist
+remove_from_whitelist() {
+    local ip="$1"
+    local backend
+    backend="$(detect_firewall)"
+
+    if [[ "$backend" == "nftables" ]]; then
+        nft_del_from_set "whitelist" "$ip" 2>/dev/null || true
+    else
+        ipset del "$IPSET_WHITELIST" "$ip" 2>/dev/null || true
+    fi
+
+    sed -i "/^$ip$/d" "$L7_WHITELIST"
+    log_info "IP $ip удалён из whitelist"
 }
 
 # Получить URL источника whitelist
@@ -631,6 +657,85 @@ set_whitelist_remote_url() {
     local url="$1"
     mkdir -p "$L7_CONFIG_DIR"
     echo "$url" > "$L7_WHITELIST_REMOTE_URL_FILE"
+}
+
+whitelist_sync_timer_enabled() {
+    command -v systemctl >/dev/null 2>&1 || return 1
+    systemctl is-enabled --quiet shield-l7-whitelist-sync.timer 2>/dev/null
+}
+
+whitelist_sync_next_run() {
+    command -v systemctl >/dev/null 2>&1 || return 0
+    systemctl show -p NextElapseUSecRealtime --value shield-l7-whitelist-sync.timer 2>/dev/null || true
+}
+
+setup_whitelist_sync_autoupdate() {
+    if ! command -v systemctl >/dev/null 2>&1; then
+        log_warn "systemctl недоступен, автообновление whitelist не включено"
+        return 1
+    fi
+
+    mkdir -p "$(dirname "$L7_WHITELIST_SYNC_SCRIPT")"
+    mkdir -p /opt/server-shield/logs
+
+    cat > "$L7_WHITELIST_SYNC_SCRIPT" << 'SCRIPT'
+#!/usr/bin/env bash
+set -euo pipefail
+
+source /opt/server-shield/modules/utils.sh 2>/dev/null || true
+source /opt/server-shield/modules/l7shield.sh
+
+init_l7_config
+url="$(get_whitelist_remote_url)"
+[[ -z "$url" ]] && exit 0
+
+export L7_WHITELIST_SYNC_SKIP_SETUP=1
+import_whitelist_from_url "$url" >> /opt/server-shield/logs/l7_whitelist_sync.log 2>&1
+SCRIPT
+
+    chmod +x "$L7_WHITELIST_SYNC_SCRIPT"
+
+    cat > "$L7_WHITELIST_SYNC_SERVICE" << UNIT
+[Unit]
+Description=Server Shield L7 whitelist sync (from URL)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=$L7_WHITELIST_SYNC_SCRIPT
+UNIT
+
+    cat > "$L7_WHITELIST_SYNC_TIMER" << 'TIMER'
+[Unit]
+Description=Server Shield L7 whitelist sync timer
+
+[Timer]
+OnBootSec=2min
+OnCalendar=daily
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+TIMER
+
+    systemctl daemon-reload
+    if ! systemctl enable --now shield-l7-whitelist-sync.timer >/dev/null 2>&1; then
+        log_warn "Не удалось включить daily автообновление whitelist"
+        return 1
+    fi
+
+    return 0
+}
+
+disable_whitelist_sync_autoupdate() {
+    if ! command -v systemctl >/dev/null 2>&1; then
+        log_warn "systemctl недоступен"
+        return 1
+    fi
+    systemctl disable --now shield-l7-whitelist-sync.timer 2>/dev/null || true
+    systemctl stop shield-l7-whitelist-sync.service 2>/dev/null || true
+    log_info "Автообновление whitelist отключено"
 }
 
 # Импорт whitelist из URL (например raw gist)
@@ -702,6 +807,12 @@ import_whitelist_from_url() {
     rm -f "$tmp"
 
     log_info "Импорт whitelist завершён: добавлено $added, уже было $exists, пропущено $invalid"
+
+    if [[ "${L7_WHITELIST_SYNC_SKIP_SETUP:-0}" != "1" ]]; then
+        if setup_whitelist_sync_autoupdate; then
+            log_info "Автообновление whitelist включено (daily)"
+        fi
+    fi
 }
 
 # Автобан IP
@@ -3618,22 +3729,45 @@ whitelist_menu() {
         echo ""
         echo -e "${WHITE}IP в whitelist (никогда не блокируются):${NC}"
         echo ""
+        local backend
+        backend="$(detect_firewall)"
         local whitelist_remote_url
         whitelist_remote_url="$(get_whitelist_remote_url)"
         if [[ -n "$whitelist_remote_url" ]]; then
             echo -e "  ${DIM}Источник:${NC} ${CYAN}$whitelist_remote_url${NC}"
             echo ""
         fi
+        if whitelist_sync_timer_enabled; then
+            local next_sync
+            next_sync="$(whitelist_sync_next_run)"
+            show_status_line "Auto-update whitelist" "on" "daily"
+            [[ -n "$next_sync" && "$next_sync" != "n/a" ]] && show_info "Следующий sync" "$next_sync"
+        else
+            show_status_line "Auto-update whitelist" "off"
+        fi
+        echo ""
         
+        local active_whitelist_ips=""
+        if [[ "$backend" == "nftables" ]]; then
+            active_whitelist_ips="$(nft_list_set "whitelist" 2>/dev/null || true)"
+        else
+            active_whitelist_ips="$(ipset list "$IPSET_WHITELIST" 2>/dev/null | grep "^[0-9]" || true)"
+        fi
+
         local i=1
-        ipset list "$IPSET_WHITELIST" 2>/dev/null | grep "^[0-9]" | while read ip; do
-            echo -e "  ${WHITE}$i)${NC} ${GREEN}$ip${NC}"
-            ((i++))
-        done
+        if [[ -n "$active_whitelist_ips" ]]; then
+            while IFS= read -r ip; do
+                [[ -z "$ip" ]] && continue
+                echo -e "  ${WHITE}$i)${NC} ${GREEN}$ip${NC}"
+                ((i++))
+            done < <(echo "$active_whitelist_ips")
+        else
+            echo -e "  ${DIM}Пока нет загруженных IP${NC}"
+        fi
         
         # Также из файла
         grep -v "^#" "$L7_WHITELIST" 2>/dev/null | grep -v "^$" | while read ip; do
-            if ! ipset test "$IPSET_WHITELIST" "$ip" 2>/dev/null; then
+            if ! echo "$active_whitelist_ips" | grep -Fxq "$ip"; then
                 echo -e "  ${YELLOW}○${NC} $ip (не загружен)"
             fi
         done
@@ -3645,6 +3779,11 @@ whitelist_menu() {
         echo -e "  ${WHITE}2)${NC} Удалить IP"
         echo -e "  ${WHITE}3)${NC} Добавить текущий IP"
         echo -e "  ${WHITE}4)${NC} Загрузить whitelist по URL (raw gist)"
+        if whitelist_sync_timer_enabled; then
+            echo -e "  ${WHITE}5)${NC} Отключить автообновление whitelist"
+        else
+            echo -e "  ${WHITE}5)${NC} Включить автообновление whitelist"
+        fi
         echo -e "  ${WHITE}0)${NC} Назад"
         echo ""
         read -p "Выбор: " choice
@@ -3662,9 +3801,7 @@ whitelist_menu() {
             2)
                 echo ""
                 read -p "IP для удаления: " ip
-                ipset del "$IPSET_WHITELIST" "$ip" 2>/dev/null
-                sed -i "/^$ip$/d" "$L7_WHITELIST"
-                log_info "IP $ip удалён из whitelist"
+                remove_from_whitelist "$ip"
                 ;;
             3)
                 local current_ip=$(echo "$SSH_CLIENT" | awk '{print $1}')
@@ -3679,6 +3816,19 @@ whitelist_menu() {
                 local url
                 read -p "URL списка (Enter = сохраненный): " url
                 import_whitelist_from_url "$url"
+                ;;
+            5)
+                if whitelist_sync_timer_enabled; then
+                    disable_whitelist_sync_autoupdate
+                else
+                    if [[ -n "$whitelist_remote_url" ]]; then
+                        if setup_whitelist_sync_autoupdate; then
+                            log_info "Автообновление whitelist включено (daily)"
+                        fi
+                    else
+                        log_warn "Сначала задайте URL через пункт 4"
+                    fi
+                fi
                 ;;
             0) return ;;
         esac

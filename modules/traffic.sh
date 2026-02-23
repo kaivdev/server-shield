@@ -32,6 +32,7 @@ detect_interface() {
 
 # Выбор интерфейса интерактивно
 select_interface() {
+    local __result_var="${1:-}"
     echo "" >&2
     echo -e "    ${WHITE}Доступные интерфейсы:${NC}"
     
@@ -57,13 +58,20 @@ select_interface() {
     local detected=$(detect_interface)
     local choice
     input_value "Выбор интерфейса" "$detected" choice
-    
+
+    local selected_iface
     if [[ -z "$choice" ]]; then
-        echo "$detected"
+        selected_iface="$detected"
     elif [[ "$choice" =~ ^[0-9]+$ ]] && [[ "$choice" -ge 1 ]] && [[ "$choice" -le ${#interfaces[@]} ]]; then
-        echo "${interfaces[$((choice-1))]}"
+        selected_iface="${interfaces[$((choice-1))]}"
     else
-        echo "$detected"
+        selected_iface="$detected"
+    fi
+
+    if [[ -n "$__result_var" ]]; then
+        printf -v "$__result_var" '%s' "$selected_iface"
+    else
+        echo "$selected_iface"
     fi
 }
 
@@ -409,7 +417,7 @@ add_limit() {
     echo ""
     echo -e "    ${WHITE}Шаг 1: Выбор сетевого интерфейса${NC}"
     local iface_raw iface
-    iface_raw="$(select_interface)" || return 1
+    select_interface iface_raw || return 1
     iface="$(printf '%s\n' "$iface_raw" \
         | tr '\r' '\n' \
         | tr '[:space:]' '\n' \
